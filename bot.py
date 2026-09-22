@@ -36,6 +36,7 @@ class AutoBuyBot:
         self.register_handlers()
 
     async def init(self):
+        await self.db.init_db()
         for site_key, config in SITES_CONFIG.items():
             parser = SiteParser(config)
             await parser.init()
@@ -47,24 +48,20 @@ class AutoBuyBot:
         await self.bot.session.close()
 
     def register_handlers(self):
-        # Commands
         self.dp.message.register(self.start_cmd, Command("start"))
         self.dp.message.register(self.add_product_cmd, Command("add"))
         self.dp.message.register(self.my_products_cmd, Command("list"))
         self.dp.message.register(self.history_cmd, Command("history"))
         self.dp.message.register(self.help_cmd, Command("help"))
 
-        # ReplyKeyboard — это текстовые сообщения, не команды
         self.dp.message.register(self.add_product_cmd, F.text == "➕ Добавить товар")
         self.dp.message.register(self.my_products_cmd, F.text == "📋 Мои товары")
         self.dp.message.register(self.history_cmd,     F.text == "📊 История")
         self.dp.message.register(self.help_cmd,        F.text == "❓ Справка")
 
-        # FSM text handlers
         self.dp.message.register(self.enter_custom_product, AddProduct.custom_product_name)
         self.dp.message.register(self.set_target_price,     AddProduct.target_price)
 
-        # Callback handlers — с StateFilter чтобы не было конфликтов
         self.dp.callback_query.register(
             self.select_site,
             F.data.startswith("site_"),
@@ -84,7 +81,8 @@ class AutoBuyBot:
     async def start_cmd(self, message: types.Message):
         user_id = message.from_user.id
         username = message.from_user.username or message.from_user.first_name
-        self.db.add_user(user_id, username)
+
+        await self.db.add_user(user_id, username)  # ← await
 
         kb = ReplyKeyboardMarkup(keyboard=[
             [KeyboardButton(text="➕ Добавить товар")],
@@ -205,21 +203,18 @@ class AutoBuyBot:
         product_name = selected_product['name'] if selected_product else data.get('custom_product_name', 'Неизвестно')
         site_key = data.get('site_key', '')
         site_name = SITES_CONFIG.get(site_key, {}).get('name', site_key)
-
         price_text = f"${price}" if price > 0 else "Любая"
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_yes"),
-                InlineKeyboardButton(text="❌ Отмена",      callback_data="confirm_no")
-            ]
-        ])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_yes"),
+            InlineKeyboardButton(text="❌ Отмена",      callback_data="confirm_no")
+        ]])
 
         await message.answer(
             f"<b>Подтверди добавление:</b>\n\n"
             f"Товар: {product_name}\n"
             f"Сайт: {site_name}\n"
-            f"Макс. цена: {price_text}\n",
+            f"Макс. цена: {price_text}",
             reply_markup=kb,
             parse_mode="HTML"
         )
@@ -240,7 +235,7 @@ class AutoBuyBot:
         product_sku = selected_product.get('id') if selected_product else None
         target_price = data.get('target_price', 0)
 
-        db_id = self.db.add_watched_product(
+        db_id = await self.db.add_watched_product(  # ← await
             user_id, site_key, product_name, product_sku,
             target_price if target_price > 0 else None
         )
@@ -261,7 +256,7 @@ class AutoBuyBot:
 
     async def my_products_cmd(self, message: types.Message):
         user_id = message.from_user.id
-        products = self.db.get_watched_products(user_id)
+        products = await self.db.get_watched_products(user_id)  # ← await
 
         if not products:
             await message.answer("📭 Ты пока ничего не отслеживаешь")
@@ -280,7 +275,7 @@ class AutoBuyBot:
 
     async def history_cmd(self, message: types.Message):
         user_id = message.from_user.id
-        purchases = self.db.get_purchase_history(user_id)
+        purchases = await self.db.get_purchase_history(user_id)  # ← await
 
         if not purchases:
             await message.answer("📭 История покупок пуста")
@@ -320,7 +315,7 @@ class AutoBuyBot:
 
         try:
             while True:
-                products = self.db.get_watched_products(user_id, "active")
+                products = await self.db.get_watched_products(user_id, "active")  # ← await
 
                 for product in products:
                     site_key = product['site_key']
@@ -334,7 +329,7 @@ class AutoBuyBot:
                     check = await parser.check_stock(product_name)
 
                     if check['found']:
-                        self.db.update_product_cache(
+                        await self.db.update_product_cache(  # ← await
                             site_key,
                             product_name,
                             product_sku or '',
@@ -363,7 +358,7 @@ class AutoBuyBot:
                             payment = InfernoCookiesPayment()
                             purchase_result = await payment.execute_purchase(product_sku)
 
-                            self.db.add_purchase(
+                            await self.db.add_purchase(  # ← await
                                 user_id, site_key, product_name, price,
                                 'success' if purchase_result['success'] else 'failed',
                                 purchase_result.get('order_id')
@@ -379,7 +374,6 @@ class AutoBuyBot:
                                 if download_url:
                                     full_url = f"https://inferno-cookies.com{download_url}"
                                     msg += f"<a href='{full_url}'>📥 Скачать</a>"
-
                                 await self.bot.send_message(user_id, msg, parse_mode="HTML")
                             else:
                                 await self.bot.send_message(
@@ -390,7 +384,7 @@ class AutoBuyBot:
                                     parse_mode="HTML"
                                 )
 
-                            self.db.remove_watched_product(product['id'])
+                            await self.db.remove_watched_product(product['id'])  # ← await
 
                 await asyncio.sleep(CHECK_INTERVAL)
 
