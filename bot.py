@@ -17,7 +17,6 @@ from payments import InfernoCookiesPayment
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FSM States
 class AddProduct(StatesGroup):
     selecting_site = State()
     selecting_product = State()
@@ -25,7 +24,6 @@ class AddProduct(StatesGroup):
     target_price = State()
     confirm = State()
 
-# Storage for active watchers
 active_watchers: Dict[int, asyncio.Task] = {}
 
 class AutoBuyBot:
@@ -36,20 +34,18 @@ class AutoBuyBot:
         self.db = Database()
         self.parsers: Dict[str, SiteParser] = {}
         self.register_handlers()
-    
+
     async def init(self):
-        """Initialize parsers"""
         for site_key, config in SITES_CONFIG.items():
             parser = SiteParser(config)
             await parser.init()
             self.parsers[site_key] = parser
-    
+
     async def close(self):
-        """Cleanup"""
         for parser in self.parsers.values():
             await parser.close()
         await self.bot.session.close()
-    
+
     def register_handlers(self):
         # Commands
         self.dp.message.register(self.start_cmd, Command("start"))
@@ -57,31 +53,45 @@ class AutoBuyBot:
         self.dp.message.register(self.my_products_cmd, Command("list"))
         self.dp.message.register(self.history_cmd, Command("history"))
         self.dp.message.register(self.help_cmd, Command("help"))
-        
-        # FSM state handlers
+
+        # ReplyKeyboard — это текстовые сообщения, не команды
+        self.dp.message.register(self.add_product_cmd, F.text == "➕ Добавить товар")
+        self.dp.message.register(self.my_products_cmd, F.text == "📋 Мои товары")
+        self.dp.message.register(self.history_cmd,     F.text == "📊 История")
+        self.dp.message.register(self.help_cmd,        F.text == "❓ Справка")
+
+        # FSM text handlers
         self.dp.message.register(self.enter_custom_product, AddProduct.custom_product_name)
-        self.dp.message.register(self.set_target_price, AddProduct.target_price)
-        
-        # Callback handlers
-        self.dp.callback_query.register(self.select_site, F.data.startswith("site_"))
-        self.dp.callback_query.register(self.select_product, F.data.startswith("prod_"))
-        self.dp.callback_query.register(self.confirm_product, F.data.startswith("confirm_"))
-    
+        self.dp.message.register(self.set_target_price,     AddProduct.target_price)
+
+        # Callback handlers — с StateFilter чтобы не было конфликтов
+        self.dp.callback_query.register(
+            self.select_site,
+            F.data.startswith("site_"),
+            StateFilter(AddProduct.selecting_site)
+        )
+        self.dp.callback_query.register(
+            self.select_product,
+            F.data.startswith("prod_"),
+            StateFilter(AddProduct.selecting_product)
+        )
+        self.dp.callback_query.register(
+            self.confirm_product,
+            F.data.startswith("confirm_"),
+            StateFilter(AddProduct.confirm)
+        )
+
     async def start_cmd(self, message: types.Message):
-        """Start command"""
         user_id = message.from_user.id
         username = message.from_user.username or message.from_user.first_name
-        
-        logger.info(f"User {user_id} ({username}) triggered /start")
-        
         self.db.add_user(user_id, username)
-        
+
         kb = ReplyKeyboardMarkup(keyboard=[
             [KeyboardButton(text="➕ Добавить товар")],
             [KeyboardButton(text="📋 Мои товары"), KeyboardButton(text="📊 История")],
             [KeyboardButton(text="❓ Справка")]
         ], resize_keyboard=True)
-        
+
         await message.answer(
             "🤖 <b>Auto Buy Bot</b>\n\n"
             "Привет! Я помогу тебе автоматически отслеживать и покупать товары.\n\n"
@@ -89,72 +99,71 @@ class AutoBuyBot:
             reply_markup=kb,
             parse_mode="HTML"
         )
-    
-    async def menu_cmd(self, message: types.Message):
-        await self.start_cmd(message)
-    
+
     async def add_product_cmd(self, message: types.Message, state: FSMContext):
-        """Add new product to watch"""
         sites_list = list(SITES_CONFIG.items())
-        
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=config['name'], callback_data=f"site_{key}")]
             for key, config in sites_list
         ])
-        
+
         await message.answer("Выбери сайт для отслеживания:", reply_markup=kb)
         await state.set_state(AddProduct.selecting_site)
-    
+
     async def select_site(self, callback: types.CallbackQuery, state: FSMContext):
-        """Site selection callback"""
         site_key = callback.data.replace("site_", "")
-        
+
         if site_key not in SITES_CONFIG:
             await callback.answer("❌ Неизвестный сайт")
             return
-        
+
         await state.update_data(site_key=site_key)
-        
-        # Fetch products
-        parser = self.parsers[site_key]
+
+        parser = self.parsers.get(site_key)
+        if not parser:
+            await callback.message.edit_text("❌ Парсер не инициализирован.")
+            return
+
         products = await parser.get_all_products()
-        
+
         if not products:
             await callback.message.edit_text("❌ Не удалось загрузить товары. Попробуй позже.")
+            await callback.answer()
             return
-        
-        # Show first 10 products
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=p['name'][:45], callback_data=f"prod_{i}")]
             for i, p in enumerate(products[:10])
         ] + [
             [InlineKeyboardButton(text="✏️ Ввести вручную", callback_data="prod_custom")]
         ])
-        
+
         await callback.message.edit_text(
             f"<b>{SITES_CONFIG[site_key]['name']}</b>\n\n"
             "Выбери товар или введи название вручную:",
             reply_markup=kb,
             parse_mode="HTML"
         )
-        
+
         await state.update_data(products=products)
         await state.set_state(AddProduct.selecting_product)
-    
+        await callback.answer()
+
     async def select_product(self, callback: types.CallbackQuery, state: FSMContext):
-        """Product selection"""
         data = await state.get_data()
         products = data.get('products', [])
-        
+
         if callback.data == "prod_custom":
             await callback.message.edit_text("Введи название товара вручную:")
             await state.set_state(AddProduct.custom_product_name)
+            await callback.answer()
             return
-        
+
         try:
             product_idx = int(callback.data.replace("prod_", ""))
             selected_product = products[product_idx]
-            
+
             await state.update_data(selected_product=selected_product)
             await callback.message.edit_text(
                 f"<b>{selected_product['name']}</b>\n"
@@ -165,93 +174,99 @@ class AutoBuyBot:
                 parse_mode="HTML"
             )
             await state.set_state(AddProduct.target_price)
+            await callback.answer()
         except (ValueError, IndexError):
             await callback.answer("❌ Ошибка выбора")
-    
+
     async def enter_custom_product(self, message: types.Message, state: FSMContext):
-        """Custom product name entry"""
         product_name = message.text.strip()
-        
+
         if len(product_name) < 2:
             await message.answer("❌ Название слишком короткое")
             return
-        
+
         await state.update_data(custom_product_name=product_name)
         await message.answer("Укажи максимальную цену для автопокупки (или 0 для любой):")
         await state.set_state(AddProduct.target_price)
-    
+
     async def set_target_price(self, message: types.Message, state: FSMContext):
-        """Set target price"""
         try:
             price = float(message.text.replace(',', '.'))
             if price < 0:
                 raise ValueError
         except ValueError:
-            await message.answer("❌ Введи корректную цену")
+            await message.answer("❌ Введи корректную цену (например: 9.99 или 0)")
             return
-        
+
         await state.update_data(target_price=price)
-        
         data = await state.get_data()
-        product_name = data.get('selected_product', {}).get('name') or data.get('custom_product_name')
-        
+
+        selected_product = data.get('selected_product')
+        product_name = selected_product['name'] if selected_product else data.get('custom_product_name', 'Неизвестно')
+        site_key = data.get('site_key', '')
+        site_name = SITES_CONFIG.get(site_key, {}).get('name', site_key)
+
+        price_text = f"${price}" if price > 0 else "Любая"
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Добавить", callback_data="confirm_yes")],
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="confirm_no")]
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_yes"),
+                InlineKeyboardButton(text="❌ Отмена",      callback_data="confirm_no")
+            ]
         ])
-        
+
         await message.answer(
-            f"<b>Проверка данных:</b>\n\n"
+            f"<b>Подтверди добавление:</b>\n\n"
             f"Товар: {product_name}\n"
-            f"Макс. цена: ${price if price > 0 else 'любая'}\n\n"
-            "Добавить в отслеживание?",
+            f"Сайт: {site_name}\n"
+            f"Макс. цена: {price_text}\n",
             reply_markup=kb,
             parse_mode="HTML"
         )
         await state.set_state(AddProduct.confirm)
-    
+
     async def confirm_product(self, callback: types.CallbackQuery, state: FSMContext):
-        """Confirm product addition"""
         if callback.data == "confirm_no":
-            await callback.message.edit_text("❌ Отменено")
+            await callback.message.edit_text("❌ Отменено.")
             await state.clear()
+            await callback.answer()
             return
-        
+
         data = await state.get_data()
         user_id = callback.from_user.id
         site_key = data['site_key']
         selected_product = data.get('selected_product')
         product_name = selected_product['name'] if selected_product else data.get('custom_product_name')
-        product_id = selected_product.get('id') if selected_product else None
+        product_sku = selected_product.get('id') if selected_product else None
         target_price = data.get('target_price', 0)
-        
-        product_id = self.db.add_watched_product(
-            user_id, site_key, product_name, product_id, target_price if target_price > 0 else None
+
+        db_id = self.db.add_watched_product(
+            user_id, site_key, product_name, product_sku,
+            target_price if target_price > 0 else None
         )
-        
+
         await callback.message.edit_text(
-            f"✅ Товар добавлен!\n\n"
-            f"ID: {product_id}\n"
+            f"✅ <b>Товар добавлен!</b>\n\n"
+            f"ID: {db_id}\n"
             f"Начинаю отслеживание...",
             parse_mode="HTML"
         )
-        
+
         await state.clear()
-        
-        # Start watching in background
+        await callback.answer()
+
         if user_id not in active_watchers:
             task = asyncio.create_task(self.watch_user_products(user_id))
             active_watchers[user_id] = task
-    
+
     async def my_products_cmd(self, message: types.Message):
-        """List watched products"""
         user_id = message.from_user.id
         products = self.db.get_watched_products(user_id)
-        
+
         if not products:
             await message.answer("📭 Ты пока ничего не отслеживаешь")
             return
-        
+
         text = "<b>📋 Мои товары:</b>\n\n"
         for product in products:
             site_name = SITES_CONFIG.get(product['site_key'], {}).get('name', 'Unknown')
@@ -260,18 +275,17 @@ class AutoBuyBot:
                 f"  Сайт: {site_name}\n"
                 f"  Статус: {product['status']}\n\n"
             )
-        
+
         await message.answer(text, parse_mode="HTML")
-    
+
     async def history_cmd(self, message: types.Message):
-        """Purchase history"""
         user_id = message.from_user.id
         purchases = self.db.get_purchase_history(user_id)
-        
+
         if not purchases:
             await message.answer("📭 История покупок пуста")
             return
-        
+
         text = "<b>📊 История покупок:</b>\n\n"
         for purchase in purchases:
             status_emoji = "✅" if purchase['status'] == 'success' else "❌"
@@ -281,101 +295,92 @@ class AutoBuyBot:
                 f"  Заказ: {purchase['order_id']}\n"
                 f"  Дата: {purchase['purchased_at']}\n\n"
             )
-        
+
         await message.answer(text, parse_mode="HTML")
-    
+
     async def help_cmd(self, message: types.Message):
-        """Help command"""
         await message.answer(
             "<b>❓ Справка</b>\n\n"
-            "/add - Добавить новый товар\n"
-            "/list - Мои товары\n"
-            "/history - История покупок\n"
-            "/help - Эта справка\n\n"
+            "/add — Добавить новый товар\n"
+            "/list — Мои товары\n"
+            "/history — История покупок\n"
+            "/help — Эта справка\n\n"
             "<b>Как это работает:</b>\n"
             "1️⃣ Выбери сайт и товар\n"
             "2️⃣ Укажи максимальную цену (опционально)\n"
             "3️⃣ Я буду проверять наличие каждую минуту\n"
-            "4️⃣ Когда товар появится - автоматически куплю\n"
+            "4️⃣ Когда товар появится — автоматически куплю\n"
             "5️⃣ Пришлю ссылку для скачивания\n\n"
             "<i>Покупка полностью автоматическая, никаких подтверждений</i>",
             parse_mode="HTML"
         )
-    
+
     async def watch_user_products(self, user_id: int):
-        """Background task: watch and auto-buy"""
         logger.info(f"Started watching products for user {user_id}")
-        
+
         try:
             while True:
                 products = self.db.get_watched_products(user_id, "active")
-                
+
                 for product in products:
                     site_key = product['site_key']
                     product_name = product['product_name']
-                    product_id = product['product_sku']
-                    
-                    parser = self.parsers[site_key]
+                    product_sku = product['product_sku']
+
+                    parser = self.parsers.get(site_key)
+                    if not parser:
+                        continue
+
                     check = await parser.check_stock(product_name)
-                    
+
                     if check['found']:
-                        # Update cache
                         self.db.update_product_cache(
                             site_key,
                             product_name,
-                            product_id or '',
+                            product_sku or '',
                             check['product'].get('price', 0),
                             check['in_stock'],
                             check.get('available_count', 0)
                         )
-                        
-                        # STOCK DETECTED - AUTO BUY
+
                         if check['in_stock']:
-                            available_count = check.get('available_count', 0)
-                            
+                            price = check['product'].get('price', 0)
+                            target = product.get('target_price')
+
+                            if target and price > target:
+                                continue
+
                             await self.bot.send_message(
                                 user_id,
                                 f"🔔 <b>ТОВАР В НАЛИЧИИ!</b>\n\n"
                                 f"'{product_name}'\n"
-                                f"Доступно: {available_count} шт.\n"
-                                f"Цена: ${check['product'].get('price', 0)}\n\n"
+                                f"Доступно: {check.get('available_count', 0)} шт.\n"
+                                f"Цена: ${price}\n\n"
                                 f"⏳ Начинаю автоматическую покупку...",
                                 parse_mode="HTML"
                             )
-                            
-                            # Execute purchase
+
                             payment = InfernoCookiesPayment()
-                            purchase_result = await payment.execute_purchase(product_id)
-                            
-                            # Log
+                            purchase_result = await payment.execute_purchase(product_sku)
+
                             self.db.add_purchase(
-                                user_id,
-                                site_key,
-                                product_name,
-                                check['product'].get('price', 0),
+                                user_id, site_key, product_name, price,
                                 'success' if purchase_result['success'] else 'failed',
                                 purchase_result.get('order_id')
                             )
-                            
-                            # Notify result
+
                             if purchase_result['success']:
-                                download_url = purchase_result.get('bundle_download_url')
-                                
+                                download_url = purchase_result.get('bundle_download_url', '')
                                 msg = (
                                     f"✅ <b>ПОКУПКА УСПЕШНА!</b>\n\n"
                                     f"Товар: {product_name}\n"
                                     f"Номер заказа: {purchase_result['order_id']}\n\n"
                                 )
-                                
                                 if download_url:
                                     full_url = f"https://inferno-cookies.com{download_url}"
                                     msg += f"<a href='{full_url}'>📥 Скачать</a>"
-                                
-                                await self.bot.send_message(
-                                    user_id,
-                                    msg,
-                                    parse_mode="HTML"
-                                )
+
+                                await self.bot.send_message(user_id, msg, parse_mode="HTML")
                             else:
                                 await self.bot.send_message(
                                     user_id,
@@ -384,21 +389,19 @@ class AutoBuyBot:
                                     f"Ошибка: {purchase_result.get('error', 'Неизвестная ошибка')}",
                                     parse_mode="HTML"
                                 )
-                            
-                            # Deactivate
+
                             self.db.remove_watched_product(product['id'])
-                
+
                 await asyncio.sleep(CHECK_INTERVAL)
-        
+
         except asyncio.CancelledError:
             logger.info(f"Stopped watching products for user {user_id}")
         except Exception as e:
             logger.error(f"Watch error for user {user_id}: {e}")
         finally:
             active_watchers.pop(user_id, None)
-    
+
     async def run(self):
-        """Run bot in polling mode"""
         await self.init()
         logger.info("Bot started (polling mode)")
         try:
